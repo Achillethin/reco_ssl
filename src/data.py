@@ -1,121 +1,100 @@
-import torch
-import torchvision.datasets as datasets
-from torch.utils.data import Dataset as Dataset_pt
-import pdb
+import os
 
-torchType = torch.float32
-NUM_WORKERS = 0
+import numpy as np
+import pandas as pd
+import torch
+from scipy import sparse
+
+
+def load_train_data(csv_file, n_items):
+    tp = pd.read_csv(csv_file)
+    n_users = tp['uid'].max() + 1
+
+    rows, cols = tp['uid'], tp['sid']
+    data = sparse.csr_matrix((np.ones_like(rows),
+                              (rows, cols)), dtype='float64',
+                             shape=(n_users, n_items))
+    return data
+
+
+def load_tr_te_data(csv_file_tr, csv_file_te, n_items):
+    tp_tr = pd.read_csv(csv_file_tr)
+    tp_te = pd.read_csv(csv_file_te)
+
+    start_idx = min(tp_tr['uid'].min(), tp_te['uid'].min())
+    end_idx = max(tp_tr['uid'].max(), tp_te['uid'].max())
+
+    rows_tr, cols_tr = tp_tr['uid'] - start_idx, tp_tr['sid']
+    rows_te, cols_te = tp_te['uid'] - start_idx, tp_te['sid']
+
+    data_tr = sparse.csr_matrix((np.ones_like(rows_tr),
+                                 (rows_tr, cols_tr)), dtype='float64', shape=(end_idx - start_idx + 1, n_items))
+    data_te = sparse.csr_matrix((np.ones_like(rows_te),
+                                 (rows_te, cols_te)), dtype='float64', shape=(end_idx - start_idx + 1, n_items))
+    return data_tr, data_te
 
 
 class Dataset():
-    """
-    Class for dealing with MNIST, including batch sizes, validation data, and
-    dynamic binarization of the batch (not used in validation)
-    """
+    def __init__(self, args, data_dir=None):
+        self.device = args.device
+        self.data = args.data
+        self.train_batch_size = args.train_batch_size
+        self.val_batch_size = args.val_batch_size
+        if data_dir:
+            DATA_DIR = data_dir + str(self.data)
+        else:
+            DATA_DIR = '../data/{}'.format(self.data)
+        if args.data in {'foursquare', 'gowalla', 'ml25m', 'ml20m', 'ml100k'}:
+            unique_sid = list()
+            with open(os.path.join(DATA_DIR, 'unique_sid.txt'), 'r') as f:
+                for line in f:
+                    unique_sid.append(line.strip())
 
-    def __init__(self, args, device):
-        self.device = device
-        if args.data == 'mnist':
-            data_train = datasets.MNIST(root='./data/mnist', download=True).train_data.type(torchType).to(device)
-            data_test = datasets.MNIST(root='./data/mnist', download=True, train=False).test_data.type(torchType).to(
-                device)
-        elif args.data == 'kmnist':
-            data_train = datasets.KMNIST(root='./data/kmnist', download=True).train_data.type(torchType).to(device)
-            data_test = datasets.KMNIST(root='./data/kmnist', download=True, train=False).test_data.type(torchType).to(
-                device)
-        elif args.data == 'FashionMNIST':
-            data_train = datasets.FashionMNIST(root='./data/FashionMNIST', download=True).train_data.type(torchType).to(
-                device)
-            data_test = datasets.FashionMNIST(root='./data/FashionMNIST', download=True, train=False).test_data.type(
-                torchType).to(device)
-        elif args.data == 'toy_data':
-            data_train = args.data_distrib.get_samples(n=args.train_data_size)
-            data_test = args.data_distrib.get_samples(n=args.train_data_size)
+            self.n_items = len(unique_sid)
+            n_items = self.n_items
+            self.train_data = load_train_data(os.path.join(DATA_DIR, 'train.csv'), n_items)
+            self.N = self.train_data.shape[0]
+
+            self.vad_data_tr, self.vad_data_te = load_tr_te_data(os.path.join(DATA_DIR, 'validation_tr.csv'),
+                                                                 os.path.join(DATA_DIR, 'validation_te.csv'), n_items)
+            self.N_vad = self.vad_data_tr.shape[0]
         else:
             raise ModuleNotFoundError
-
-        self.data = args.data
-        
-        self.img_h = 28
-        self.img_w = 28
-        self.img_c = 1
-        
-
-        if args.n_data <= 0:
-            data_train = data_train[torch.randperm(data_train.size()[0])]
-            n_data = data_train.shape[0]
-        else:
-            data_train = data_train[torch.randperm(data_train.size()[0])][:args.n_data]
-            n_data = data_train.shape[0]
-#         pdb.set_trace()
-        if max(args.vds, args.train_batch_size, args.test_batch_size, args.val_batch_size) > n_data:
-            raise ValueError(
-                'Batch size for training, batch size for validation, batch size for test and number of data for validation should all be smaller than total data')
-        if args.data != 'toy_data':
-            data_train /= data_train.max()
-            data_test /= data_test.max()
-        self.validation = data_train[:args.vds].data
-        self.train = data_train[args.vds:].data
-        self.test = data_test.data
-
-        # kwargs = {'num_workers': NUM_WORKERS} if device.startswith('cuda') else {}
-        kwargs = {}
-
-        self.train_batch_size = args.train_batch_size
-
-        self.train_dataloader = torch.utils.data.DataLoader(self.train,
-                                                            batch_size=self.train_batch_size, shuffle=True, **kwargs)
-
-        self.n_IS = args.n_IS
-
-        self.val_batch_size = args.val_batch_size
-        self.val_dataloader = torch.utils.data.DataLoader(self.validation,
-                                                          batch_size=self.val_batch_size, shuffle=False, **kwargs)
-
-        self.test_batch_size = args.test_batch_size
-        self.test_dataloader = torch.utils.data.DataLoader(self.test,
-                                                           batch_size=self.test_batch_size, shuffle=False, **kwargs)
 
     def next_train_batch(self):
         """
         Training batches will reshuffle every epoch and involve dynamic
         binarization
         """
-        if self.data == 'toy_data':
-            for batch in self.train_dataloader:
-                yield batch  
-        else:
-            for batch in self.train_dataloader:
-                if self.img_c == 1:
-                    batch = torch.distributions.Binomial(probs=batch).sample()
-                batch = batch.view([-1, self.img_c, self.img_h, self.img_w])
-                yield batch
+        idxlist = np.arange(self.N)
+        np.random.shuffle(idxlist)
+        for bnum, st_idx in enumerate(range(0, self.N, self.train_batch_size)):
+            end_idx = min(st_idx + self.train_batch_size, self.N)
+            X = self.train_data[idxlist[st_idx:end_idx]]
+
+            if sparse.isspmatrix(X):
+                X = X.toarray()
+            X = torch.tensor(X, dtype=torch.float32).to(self.device)
+            yield X
 
     def next_val_batch(self):
         """
         Validation batches will be used for ELBO estimates without importance
         sampling (could change)
         """
-        if self.data == 'toy_data':
-            for batch in self.val_dataloader:
-                yield batch 
-        else:
-            for batch in self.val_dataloader:
-                batch = batch.view([-1, self.img_c, self.img_h, self.img_w])
-                yield batch
+        idxlist_vad = np.arange(self.N_vad)
+        for bnum, st_idx in enumerate(range(0, self.N_vad, self.val_batch_size)):
+            end_idx = min(st_idx + self.val_batch_size, self.N_vad)
+            X = self.vad_data_tr[idxlist_vad[st_idx:end_idx]]
+            X_ = self.vad_data_te[idxlist_vad[st_idx:end_idx]]
+            if sparse.isspmatrix(X):
+                X = X.toarray()
+            X = torch.tensor(X, dtype=torch.float32).to(self.device)
+            yield X, X_
 
     def next_test_batch(self):
         """
         Test batches are same as validation but with added binarization
         """
-        if self.data == 'toy_data':
-            for batch in self.test_dataloader:
-                batch = batch.repeat(self.n_IS, 1)
-                yield batch 
-        else:
-            for batch in self.test_dataloader:
-                if self.img_c == 1:
-                    batch = torch.distributions.Binomial(probs=batch).sample()
-                    batch = batch.view([-1, self.img_c, self.img_h, self.img_w])
-                batch = batch.repeat(self.n_IS, 1, 1, 1)
-                yield batch
+        for test_batch in self.test_dataloader:
+            yield test_batch

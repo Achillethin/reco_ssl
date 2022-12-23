@@ -1,120 +1,298 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-torchType = torch.float32
-
-class Identity(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-    def forward(self, x):
-        return x
-
-class Inf_network(nn.Module):
-    def __init__(self, kwargs):
-        super(Inf_network, self).__init__()
-        args = kwargs
-        self.z_dim = args.z_dim
-        self.size_h = 28
-        self.size_w = 28
-        self.size_c = 1
-        
-        self.conv1 = nn.Conv2d(in_channels=self.size_c, out_channels=16, kernel_size=5,
-                               stride=2, padding=2)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=5,
-                               stride=2, padding=2)
-        self.conv3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=5,
-                               stride=2, padding=2)
-        self.linear = nn.Linear(in_features=512, out_features=450)
-        self.mu = nn.Linear(in_features=450, out_features=self.z_dim)
-        self.sigma = nn.Linear(in_features=450, out_features=self.z_dim)
-
-    def forward(self, x):
-        h1 = F.softplus(self.conv1(x))
-        h2 = F.softplus(self.conv2(h1))
-        h3 = F.softplus(self.conv3(h2))
-        h3_flat = h3.view(h3.shape[0], -1)
-        h4 = F.softplus(self.linear(h3_flat))
-        mu = self.mu(h4)
-        sigma = F.softplus(self.sigma(h4))
-        return mu, sigma
+from scipy.stats import truncnorm
+import pdb
+from kernels import HMC_our, Reverse_kernel
 
 
-class Gen_network(nn.Module):
-    def __init__(self, z_dim, args):
-        super(Gen_network, self).__init__()
-        self.z_dim = z_dim
-        self.linear1 = nn.Linear(in_features=self.z_dim, out_features=450)
-        self.linear2 = nn.Linear(in_features=450, out_features=512)
-        self.size_h = 28
-        self.size_w = 28
-        self.size_c = 1
-        self.use_batchnorm = args.use_batchnorm
-        if self.use_batchnorm:
-            self.bn = nn.BatchNorm1d(450)
-            self.bn1 = nn.BatchNorm2d(32)
-            self.bn2 = nn.BatchNorm2d(16)
+def truncated_normal(size, std=1):
+    values = truncnorm.rvs(-2. * std, 2. * std, size=size)
+    return values
+
+
+def make_linear_network(dims, encoder=False):
+    layer_list = nn.ModuleList([])
+    for i in range(len(dims) - 1):
+        if i == len(dims) - 2 and encoder:
+            layer_list.append(nn.Linear(dims[i], 2 * dims[i + 1]))
         else:
-            self.bn = Identity()
-            self.bn1 = Identity()
-            self.bn2 = Identity()
+            layer_list.append(nn.Linear(dims[i], dims[i + 1]))
+        layer_list[-1].weight = nn.init.xavier_uniform_(layer_list[-1].weight)
+        layer_list[-1].bias = nn.Parameter(
+            torch.tensor(truncated_normal(layer_list[-1].bias.shape, 0.001), dtype=torch.float32))
+        layer_list.append(nn.Tanh())
+    layer_list = layer_list[:-1]
+    model = nn.Sequential(*layer_list)
+    return model
 
-        if args.decoder == "deconv":
-            self.deconv1 = nn.ConvTranspose2d(in_channels=32, out_channels=32, kernel_size=5,
-                                              stride=2, padding=2)
-            self.deconv2 = nn.ConvTranspose2d(in_channels=32, out_channels=16, kernel_size=5,
-                                              stride=2, padding=2, output_padding=1)
-            self.deconv3 = nn.ConvTranspose2d(in_channels=16, out_channels=self.size_c, kernel_size=5,
-                                              stride=2, padding=2, output_padding=1)
-        elif args.decoder == "bilinear":
-            self.deconv1 = nn.Sequential(nn.UpsamplingBilinear2d(size=(7, 7)),
-                                         nn.Conv2d(in_channels=32, out_channels=32, kernel_size=1))
-            self.deconv2 = nn.Sequential(nn.UpsamplingBilinear2d(size=(14, 14)),
-                                         nn.Conv2d(in_channels=32, out_channels=16, kernel_size=1))
-            self.deconv3 = nn.Sequential(nn.UpsamplingBilinear2d(size=(self.size_h, self.size_w)),
-                                         nn.Conv2d(in_channels=16, out_channels=self.size_c, kernel_size=1))
 
+class MultiVAE(nn.Module):
+    '''
+    Model described in the paper Liang, Dawen, et al. "Variational autoencoders for collaborative filtering." Proceedings of the 2018 World Wide Web Conference. 2018.
+    '''
+
+    def __init__(self, p_dims, q_dims=None, args=None):
+        super(MultiVAE, self).__init__()
+
+        self.p_dims = p_dims
+        if q_dims is None:
+            self.q_dims = p_dims[::-1]
+            q_dims = self.q_dims
+        else:
+            assert q_dims[0] == p_dims[-1], "Input and output dimension must equal each other for autoencoders."
+            assert q_dims[-1] == p_dims[0], "Latent dimension for p- and q-network mismatches."
+            self.q_dims = q_dims
+
+        self.encoder = make_linear_network(q_dims, encoder=True)
+        print(self.encoder)
+
+        self.decoder = make_linear_network(p_dims)
+        print(self.decoder)
+
+        self.dropout = nn.Dropout()
+
+        device_zero = torch.tensor(0., dtype=torch.float32, device=args.device)
+        device_one = torch.tensor(1., dtype=torch.float32, device=args.device)
+        self.std_normal = torch.distributions.Normal(loc=device_zero, scale=device_one)
+
+    def forward(self, x_initial, is_training_ph=1.):
+        l2 = torch.sum(x_initial ** 2, 1)[..., None]
+        x_normed = x_initial / torch.sqrt(torch.max(l2, torch.ones_like(l2) * 1e-12))
+        x = self.dropout(x_normed)
+
+        enc_out = self.encoder(x)
+        mu, logvar = enc_out[:, :self.q_dims[-1]], enc_out[:, self.q_dims[-1]:]
+        std = torch.exp(0.5 * logvar)
+
+        u = self.std_normal.sample(mu.shape)
+        z = mu + is_training_ph * u * std
+
+        KL = torch.mean(torch.sum(0.5 * (-logvar + torch.exp(logvar) + mu ** 2 - 1), dim=1))
+        logits = self.decoder(z)
+
+        return logits, KL
+
+
+class Target(nn.Module):
+    def __init__(self, dec, device='cpu'):
+        super(Target, self).__init__()
+        self.decoder = dec
+        self.prior = torch.distributions.Normal(loc=torch.tensor(0., device=device, dtype=torch.float32),
+                                                scale=torch.tensor(1., device=device, dtype=torch.float32))
+
+    def get_logdensity(self, x, z, prior=None, args=None, prior_flow=None):
+        """
+        The method returns target logdensity
+        Input:
+        x - datapoint
+        z - latent vaiable
+        Output:
+        log_density - log p(x, z)
+        """
+        logits = self.decoder(z)
+        log_softmax_var = nn.LogSoftmax(dim=-1)(logits)
+        log_density = torch.sum(log_softmax_var * x, dim=1) + self.prior.log_prob(z).sum(1)
+        return log_density
+
+
+class Multi_our_VAE(nn.Module):
+    def __init__(self, p_dims, q_dims=None, args=None):
+        super(Multi_our_VAE, self).__init__()
+
+        self.p_dims = p_dims
+        if q_dims is None:
+            self.q_dims = p_dims[::-1]
+            q_dims = self.q_dims
+        else:
+            assert q_dims[0] == p_dims[-1], "Input and output dimension must equal each other for autoencoders."
+            assert q_dims[-1] == p_dims[0], "Latent dimension for p- and q-network mismatches."
+            self.q_dims = q_dims
+
+        ## Define encoder
+        self.encoder = make_linear_network(q_dims, encoder=True)
+        print(self.encoder)
+
+        ## Define target(decoder)
+        decoder = make_linear_network(p_dims)
+        print(decoder)
+        self.target = Target(dec=decoder, device=args.device)
+
+        ## Define transitions
+        self.K = args.K
+        self.transitions = nn.ModuleList([HMC_our(kwargs=args).to(args.device) for _ in range(args['K'])])
+
+        ## Define reverse kernel (if it is needed)
+        self.learnable_reverse = args.learnable_reverse
+        if args.learnable_reverse:
+            self.reverse_kernel = Reverse_kernel(kwargs=args).to(args.device)
+
+        self.dropout = nn.Dropout()
+
+        device_zero = torch.tensor(0., dtype=torch.float32, device=args.device)
+        device_one = torch.tensor(1., dtype=torch.float32, device=args.device)
+        self.std_normal = torch.distributions.Normal(loc=device_zero, scale=device_one)
+        self.torch_log_2 = torch.tensor(np.log(2), device=args.device, dtype=args.torchType)
+        self.annealing = args.annealing
+        self.momentum_scale = nn.Parameter(torch.zeros(args.z_dim, device=args.device, dtype=args.torchType)[None, :],
+                                           requires_grad=args.learnscale)  ## Comment this line for this case validating ml20m models with option annealing = False
+
+    def forward(self, x_initial, is_training_ph=1.):
+        # self.momentum_scale = nn.Parameter(torch.zeros(self.q_dims[-1], device=x_initial.device, dtype=torch.float32)[None, :],
+        #                                    requires_grad=False) Uncomment this line for this case validating ml20m models with option annealing = False
+        l2 = torch.sum(x_initial ** 2, 1)[..., None]
+        x_normed = x_initial / torch.sqrt(torch.max(l2, torch.ones_like(l2) * 1e-12))
+        x = self.dropout(x_normed)
+
+        enc_out = self.encoder(x)
+        mu, logvar = enc_out[:, :self.q_dims[-1]], enc_out[:, self.q_dims[-1]:]
+        std = torch.exp(0.5 * logvar)
+        sum_log_alpha = torch.zeros_like(mu[:, 0])
+        sum_log_jacobian = torch.zeros_like(mu[:, 0])
+
+        u = self.std_normal.sample(mu.shape)
+        z = mu + is_training_ph * u * std
+
+        scales = torch.exp(self.momentum_scale)
+        p_ = self.std_normal.sample(z.shape) * scales
+        p_old = p_.clone()
+
+        all_directions = torch.tensor([], device=x.device)
+
+        for i in range(self.K):
+            cond_vector = self.std_normal.sample(p_.shape) * scales
+            z, p_, log_jac, current_log_alphas, directions, _ = self.transitions[i].make_transition(q_old=z, x=x,
+                                                                                                    p_old=p_,
+                                                                                                    k=cond_vector,
+                                                                                                    target_distr=self.target,
+                                                                                                    scales=scales)
+            sum_log_alpha = sum_log_alpha + current_log_alphas
+            sum_log_jacobian = sum_log_jacobian + log_jac
+            all_directions = torch.cat([all_directions, directions.view(-1, 1)], dim=1)
+
+        ## logdensity of Variational family
+        log_sigma = torch.log(std)
+        log_q = self.std_normal.log_prob(u) + self.std_normal.log_prob(p_old / scales) - log_sigma
+        log_aux = sum_log_alpha - sum_log_jacobian
+
+        ## logdensity of prior
+        log_priors = self.std_normal.log_prob(z) + self.std_normal.log_prob(p_ / scales)
+
+        ## logits
+        logits = self.target.decoder(z)
+
+        ## logdensity of reverse (if needed)
+        if self.learnable_reverse:
+            log_r = self.reverse_kernel(z_fin=z.detach(), h=mu.detach(), a=all_directions)
+        else:
+            log_r = -self.K * self.torch_log_2
+
+        return logits, log_q, log_aux, log_priors, log_r, sum_log_alpha, all_directions
+
+
+    
+class SimCLR_reco_model(nn.Module):
+    
+    def __init__(self, args,  p_dims,  q_dims=None, layers_proj = None):
+        super(SimCLR_reco_model, self).__init__()
+
+        self.p_dims = p_dims
+        if q_dims is None:
+            self.q_dims = p_dims[::-1]
+            q_dims = self.q_dims
+        else:
+            assert q_dims[0] == p_dims[-1], "Input and output dimension must equal each other for autoencoders."
+            assert q_dims[-1] == p_dims[0], "Latent dimension for p- and q-network mismatches."
+            self.q_dims = q_dims
+        self.args = args
+        self.args.n_views = 2 
+        self.n_views = 2
+        self.encoder = make_linear_network(q_dims, encoder=False)
+        print(self.encoder)
+
+        self.decoder = make_linear_network(p_dims)
+        print(self.decoder)
+        if args.dropout_rate is None:
+            self.dropout = nn.Dropout()
+        else:
+            self.dropout = nn.Dropout(p=args.dropout_rate)
+        device_zero = torch.tensor(0., dtype=torch.float32, device=args.device)
+        device_one = torch.tensor(1., dtype=torch.float32, device=args.device)
+
+        self.args = args
+        if args.criterion_dec is None:
+            self.criterion_dec = nn.MSELoss().to(self.args.device)
+        else:
+            self.criterion_dec = args.criterion_dec.to(self.args.device)
+            
+        self.criterion_enc = nn.CrossEntropyLoss().to(self.args.device)
+        
+        if layers_proj is None:
+            self.projection_head = nn.Identity
+            self.proj = False
+        else:
+            self.projection_head = make_linear_network(layers_proj, encoder = True)
+            self.proj = True
+        
     def forward(self, x):
-        h1 = F.softplus(self.bn(self.linear1(x)))
-        h2_flatten = F.softplus(self.linear2(h1))
-        h2 = h2_flatten.view(-1, 32, 4, 4)
-        h3 = F.softplus(self.bn1(self.deconv1(h2)))
-        h4 = F.softplus(self.bn2(self.deconv2(h3)))
-        bernoulli_logits = self.deconv3(h4)
-        return [bernoulli_logits, None]
+        return self.encoder(x)
+    
+    
+    def simclr_info_nce_loss(self, x_initial): 
+        #pdb.set_trace()
+        l2 = torch.sum(x_initial ** 2, 1)[..., None]
+        x_normed = x_initial / torch.sqrt(torch.max(l2, torch.ones_like(l2) * 1e-12))
+        x1 = self.dropout(x_normed)
+        x2 = self.dropout(x_normed)
+        batch_size = x1.shape[0]
+        
+        x = torch.cat([x1, x2], dim=0)
+        features = self.encoder(x)
+        labels = torch.cat([torch.arange(batch_size) for i in range(2)], dim=0) ##Vector of size 2*bs, because we have two psoitive exampkes here x1 and x2
+        labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        labels = labels.to(self.args.device)
 
+        features = F.normalize(features, dim=1)
+        
+        similarity_matrix = torch.matmul(features, features.T)
+        # assert similarity_matrix.shape == (
+        #     self.args.n_views * self.args.batch_size, self.args.n_views * self.args.batch_size)
+        # assert similarity_matrix.shape == labels.shape
 
-class Inf_network_simple(nn.Module):
-    def __init__(self, kwargs):
-        super(Inf_network_simple, self).__init__()
-        args = kwargs
-        self.z_dim = args.z_dim
-        self.input_dim = args.data_dim
+        # discard the main diagonal from both: labels and similarities matrix
+        mask = torch.eye(labels.shape[0], dtype=torch.bool).to(self.args.device)
+        labels = labels[~mask].view(labels.shape[0], -1)
+        similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
+        # assert similarity_matrix.shape == labels.shape
 
-        self.linear = nn.Linear(in_features=self.input_dim, out_features=20 * args.z_dim)
-        self.mu = nn.Linear(in_features=20 * args.z_dim, out_features=self.z_dim)
-        self.sigma = nn.Linear(in_features=20 * args.z_dim, out_features=self.z_dim)
+        # select and combine multiple positives
+        positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
 
-    def forward(self, x):
-        h4 = F.softplus(self.linear(x))
-        mu = self.mu(h4)
-        sigma = F.softplus(self.sigma(h4))
-        return mu, sigma
+        # select only the negatives the negatives
+        negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
 
+        logits = torch.cat([positives, negatives], dim=1)
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(self.args.device)
 
-class Gen_network_simple(nn.Module):
-    def __init__(self, z_dim, kwargs):
-        super(Gen_network_simple, self).__init__()
-        args = kwargs
-        self.z_dim = args.z_dim
-        self.output_dim = args.data_dim
+        logits = logits / self.args.temperature
+        return logits, labels
 
-        self.linear = nn.Linear(in_features=self.z_dim, out_features=5 * args.z_dim)
-        self.mu = nn.Linear(in_features=5 * args.z_dim, out_features=self.output_dim)
-        self.sigma = nn.Linear(in_features=5 * args.z_dim, out_features=self.output_dim)
-
-    def forward(self, x):
-        h4 = F.softplus(self.linear(x))
-        mu = self.mu(h4)
-        sigma = F.softplus(self.sigma(h4))
-        return mu, sigma
+    
+    def step_encoder(self, batch):
+        logits, labels = self.simclr_info_nce_loss(batch)
+        loss = self.criterion_enc(logits, labels)
+        return loss
+    
+    
+    def step_decoder(self, x):
+        #pdb.set_trace()
+        z_ = self.encoder(x)
+        pred_logits = self.decoder(z_)
+        pred = nn.Softmax(dim=-1)(pred_logits)
+        return self.criterion_dec(pred, x), pred
+        
+        
+        
+        
+   

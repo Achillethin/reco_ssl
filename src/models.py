@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from scipy.stats import truncnorm
 import pdb
 from kernels import HMC_our, Reverse_kernel
-
+import copy
 
 def truncated_normal(size, std=1):
     values = truncnorm.rvs(-2. * std, 2. * std, size=size)
@@ -22,6 +22,8 @@ def make_linear_network(dims, encoder=False):
         layer_list[-1].weight = nn.init.xavier_uniform_(layer_list[-1].weight)
         layer_list[-1].bias = nn.Parameter(
             torch.tensor(truncated_normal(layer_list[-1].bias.shape, 0.001), dtype=torch.float32))
+        #if i != len(dims) - 2:
+        layer_list.append(nn.BatchNorm1d(dims[i + 1]))
         layer_list.append(nn.Tanh())
     layer_list = layer_list[:-1]
     model = nn.Sequential(*layer_list)
@@ -293,6 +295,106 @@ class SimCLR_reco_model(nn.Module):
         return self.criterion_dec(pred, x), pred
         
         
+class BYOL_reco_model(nn.Module):
+    def __init__(self, args, p_dims, q_dims= None, layers_pred = None):#online_network, target_network, predictor, optimizer, device, **params):
+        super(BYOL_reco_model, self).__init__()
+        #self.online_network = online_network
+        #self.target_network = target_network
+        #self.optimizer = optimizer
+        #self.device = device
+        self.m = .996 if (args['m'] is None) else args.m
+        print('m ', self.m)
+        #self.batch_size = params['batch_size']
+        #self.num_workers = params['num_workers']
+        #self.checkpoint_interval = params['checkpoint_interval']
+        #_create_model_training_folder(self.writer, files_to_same=["./config/config.yaml", "main.py", 'trainer.py'])
         
+        self.p_dims = p_dims
+        if q_dims is None:
+            self.q_dims = p_dims[::-1]
+            q_dims = self.q_dims
+        else:
+            assert q_dims[0] == p_dims[-1], "Input and output dimension must equal each other for autoencoders."
+            assert q_dims[-1] == p_dims[0], "Latent dimension for p- and q-network mismatches."
+            self.q_dims = q_dims
+        dim_feat = self.p_dims[0]
+        if layers_pred is None:
+            layers_pred = [dim_feat, 2*dim_feat, dim_feat]
+        self.args = args
+        self.online_network = make_linear_network(q_dims, encoder=False)
+        self.target_network = make_linear_network(q_dims, encoder=False)
+        print(self.target_network)
+        self.predictor = make_linear_network(layers_pred, encoder = False)
+        
+        self.decoder = make_linear_network(p_dims)
+        print(self.decoder)
+        if args.dropout_rate is None:
+            self.dropout = nn.Dropout()
+        else:
+            self.dropout = nn.Dropout(p=args.dropout_rate)
+        device_zero = torch.tensor(0., dtype=torch.float32, device=args.device)
+        device_one = torch.tensor(1., dtype=torch.float32, device=args.device)
+
+        self.args = args
+        if args.criterion_dec is None:
+            self.criterion_dec = nn.MSELoss().to(self.args.device)
+        else:
+            self.criterion_dec = args.criterion_dec.to(self.args.device)
+            
+        #self.criterion_enc = nn.CrossEntropyLoss().to(self.args.device)
+        
+        
+    @torch.no_grad()
+    def _update_target_network_parameters(self):
+        """
+        Momentum update of the key encoder
+        """
+        for param_q, param_k in zip(self.online_network.parameters(), self.target_network.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+
+    @staticmethod
+    def regression_loss(x, y):
+        x = F.normalize(x, dim=1)
+        y = F.normalize(y, dim=1)
+        return 2 - 2 * (x * y).sum(dim=-1)
+
+    def initializes_target_network(self):
+        # init momentum network as encoder net
+        for param_q, param_k in zip(self.online_network.parameters(), self.target_network.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
+
+
+    def update(self, x):
+        l2 = torch.sum(x ** 2, 1)[..., None]
+        x_normed = x / torch.sqrt(torch.max(l2, torch.ones_like(l2) * 1e-12))
+        x1 = self.dropout(x_normed)
+        x2 = self.dropout(x_normed)
+        batch_size = x1.shape[0]
+        
+        # compute query feature
+        predictions_from_view_1 = self.predictor(self.online_network(x1))
+        predictions_from_view_2 = self.predictor(self.online_network(x2))
+
+        # compute key features
+        with torch.no_grad():
+            targets_to_view_2 = self.target_network(x1)
+            targets_to_view_1 = self.target_network(x2)
+
+        loss = self.regression_loss(predictions_from_view_1, targets_to_view_1)
+        loss += self.regression_loss(predictions_from_view_2, targets_to_view_2)
+        return loss.mean() 
+    
+    
+    
+    
+    def step_decoder(self, x):
+        #pdb.set_trace()
+        z_ = self.online_network(x)
+        pred_logits = self.decoder(z_)
+        pred = nn.Softmax(dim=-1)(pred_logits)
+        return self.criterion_dec(pred, x), pred
+        
+    
         
    

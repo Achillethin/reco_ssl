@@ -5,6 +5,74 @@ from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
 
+def train_byol_model(model, dataset, args):
+    metric_vad = []
+    best_metric = -np.inf
+    update_count = 0
+    num_epochs = args['n_epoches']
+    num_epochs_dec = num_epochs if args['n_epoches_dec'] is None else args['n_epoches_dec']
+    if args.lrenc is None:
+        lrenc = args.lrdec
+    else:
+        lrenc = args.lrenc
+    lrdec = args.lrdec
+    optimizer_byol = torch.optim.Adam([{'params':model.online_network.parameters()}, {'params':model.predictor.parameters()}], lr=lrenc)
+    optimizer_dec = torch.optim.Adam(params=model.decoder.parameters(), lr=lrdec)
+    losses = []
+    model.initializes_target_network()
+
+    for epoch_counter in range(num_epochs):
+
+        for b_num, batch in enumerate(dataset.next_train_batch()):
+
+            #batch_view_1 = batch_view_1.to(self.device)
+            #batch_view_2 = batch_view_2.to(self.device)
+
+            loss = model.update(batch)
+
+            optimizer_byol.zero_grad()
+            loss.backward()
+            optimizer_byol.step()
+
+            model._update_target_network_parameters()  # update the key encoder
+            update_count += 1
+        print('Epoch ', epoch_counter, 'Loss ', loss)
+            
+    for epoch in tqdm(range(num_epochs_dec)):
+        model.train()
+        for b_num, batch in enumerate(dataset.next_train_batch()):
+            loss, _ = model.step_decoder(batch)
+            loss.backward()
+            optimizer_dec.step()
+            optimizer_dec.zero_grad()
+        
+        model.eval()
+        with torch.no_grad():
+            metric_dist = []
+            for bnum, batch_val in enumerate(dataset.next_val_batch()):
+                reshaped_batch = batch_val[0].repeat((args.n_val_samples, 1))
+                is_training_ph = int(args.n_val_samples > 1)
+                _, pred_val = model.step_decoder(reshaped_batch)
+                pred_val = pred_val.view((args.n_val_samples, *batch_val[0].shape)).mean(0)
+                X = batch_val[0].cpu().detach().numpy()
+                pred_val = pred_val.cpu().detach().numpy()
+                # exclude examples from training and validation (if any)
+                pred_val[X.nonzero()] = -np.inf
+                metric_dist.append(args.metric(pred_val, batch_val[1]))
+
+            metric_dist = np.concatenate(metric_dist)
+            current_metric = metric_dist.mean()
+            metric_vad.append(current_metric)
+            
+            if current_metric > best_metric:
+                best_metric = current_metric
+            # update the best model (if necessary)
+            if epoch % args.print_info_ == 0:
+                print('Best NDCG:', best_metric)
+                print('Current NDCG:', current_metric)
+        
+    return metric_vad, model
+    # save checkpoints
 
 
 def train_simclr_model(model, dataset, args):
@@ -53,7 +121,8 @@ def train_simclr_model(model, dataset, args):
             metric_dist = np.concatenate(metric_dist)
             current_metric = metric_dist.mean()
             metric_vad.append(current_metric)
-
+            if current_metric > best_metric:
+                best_metric = current_metric
             # update the best model (if necessary)
             if epoch % args.print_info_ == 0:
                 print('Best NDCG:', best_metric)
